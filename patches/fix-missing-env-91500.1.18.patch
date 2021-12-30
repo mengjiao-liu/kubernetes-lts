@@ -1,4 +1,4 @@
-From 4da0e64bc1b9c23b71589ff38e875ff67e8f649e Mon Sep 17 00:00:00 2001
+From a7a9fbcd082c42175870d6ebe6d5b89d87ef8747 Mon Sep 17 00:00:00 2001
 From: David Eads <deads@redhat.com>
 Date: Wed, 27 May 2020 11:44:14 -0400
 Subject: [PATCH] reduce race risk in kubelet for missing
@@ -8,14 +8,13 @@ Subject: [PATCH] reduce race risk in kubelet for missing
  pkg/kubelet/kubelet.go           |  21 ++++-
  pkg/kubelet/kubelet_pods.go      |  12 +++
  pkg/kubelet/kubelet_pods_test.go | 152 +++++++++++++++++++------------
- pkg/kubelet/kubelet_test.go      |   1 +
- 4 files changed, 123 insertions(+), 63 deletions(-)
+ 3 files changed, 122 insertions(+), 63 deletions(-)
 
 diff --git a/pkg/kubelet/kubelet.go b/pkg/kubelet/kubelet.go
-index 9315f4915fb..e2d52032d55 100644
+index 1d571c33b07..ace2004cdb1 100644
 --- a/pkg/kubelet/kubelet.go
 +++ b/pkg/kubelet/kubelet.go
-@@ -31,6 +31,8 @@ import (
+@@ -32,6 +32,8 @@ import (
  	"sync/atomic"
  	"time"
  
@@ -24,7 +23,7 @@ index 9315f4915fb..e2d52032d55 100644
  	cadvisorapi "github.com/google/cadvisor/info/v1"
  	utilexec "k8s.io/utils/exec"
  	"k8s.io/utils/integer"
-@@ -434,13 +436,18 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+@@ -530,13 +532,18 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
  		PodCgroupRoot:            kubeDeps.ContainerManager.GetPodCgroupRoot(),
  	}
  
@@ -46,17 +45,17 @@ index 9315f4915fb..e2d52032d55 100644
  	}
 -	serviceLister := corelisters.NewServiceLister(serviceIndexer)
  
- 	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
- 	if kubeDeps.KubeClient != nil {
-@@ -500,6 +507,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+ 	// TODO: get the real node object of ourself,
+ 	// and use the real node name and UID.
+@@ -587,6 +594,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
  		registerSchedulable:                     registerSchedulable,
  		dnsConfigurer:                           dns.NewConfigurer(kubeDeps.Recorder, nodeRef, parsedNodeIP, clusterDNS, kubeCfg.ClusterDomain, kubeCfg.ResolverConfig),
  		serviceLister:                           serviceLister,
 +		serviceHasSynced:                        serviceHasSynced,
  		nodeLister:                              nodeLister,
+ 		nodeHasSynced:                           nodeHasSynced,
  		masterServiceNamespace:                  masterServiceNamespace,
- 		streamingConnectionIdleTimeout:          kubeCfg.StreamingConnectionIdleTimeout.Duration,
-@@ -885,6 +893,9 @@ type Kubelet struct {
+@@ -976,6 +984,9 @@ type Kubelet struct {
  	masterServiceNamespace string
  	// serviceLister knows how to list services
  	serviceLister serviceLister
@@ -65,12 +64,12 @@ index 9315f4915fb..e2d52032d55 100644
 +	serviceHasSynced cache.InformerSynced
  	// nodeLister knows how to list nodes
  	nodeLister corelisters.NodeLister
- 
+ 	// nodeHasSynced indicates whether nodes have been sync'd at least once.
 diff --git a/pkg/kubelet/kubelet_pods.go b/pkg/kubelet/kubelet_pods.go
-index d70acf1d803..51da1481c71 100644
+index 65a9fd74627..4feff10400d 100644
 --- a/pkg/kubelet/kubelet_pods.go
 +++ b/pkg/kubelet/kubelet_pods.go
-@@ -553,6 +553,18 @@ func (kl *Kubelet) makeEnvironmentVariables(pod *v1.Pod, container *v1.Container
+@@ -567,6 +567,18 @@ func (kl *Kubelet) makeEnvironmentVariables(pod *v1.Pod, container *v1.Container
  		return nil, fmt.Errorf("nil pod.spec.enableServiceLinks encountered, cannot construct envvars")
  	}
  
@@ -90,13 +89,13 @@ index d70acf1d803..51da1481c71 100644
  	// Note:  These are added to the docker Config, but are not included in the checksum computed
  	// by kubecontainer.HashContainer(...).  That way, we can still determine whether an
 diff --git a/pkg/kubelet/kubelet_pods_test.go b/pkg/kubelet/kubelet_pods_test.go
-index 5886f49d6a9..6643c836e8b 100644
+index a542845c46e..2fac3ba3f76 100644
 --- a/pkg/kubelet/kubelet_pods_test.go
 +++ b/pkg/kubelet/kubelet_pods_test.go
 @@ -48,6 +48,7 @@ import (
  	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
- 	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/portforward"
- 	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/remotecommand"
+ 	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
+ 	"k8s.io/kubernetes/pkg/kubelet/server/remotecommand"
 +	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
  	"k8s.io/kubernetes/pkg/volume/util/hostutil"
  	"k8s.io/kubernetes/pkg/volume/util/subpath"
@@ -279,18 +278,6 @@ index 5886f49d6a9..6643c836e8b 100644
  	}
  }
  
-diff --git a/pkg/kubelet/kubelet_test.go b/pkg/kubelet/kubelet_test.go
-index f85cdc1aee5..b22a286c6a9 100644
---- a/pkg/kubelet/kubelet_test.go
-+++ b/pkg/kubelet/kubelet_test.go
-@@ -180,6 +180,7 @@ func newTestKubeletWithImageList(
- 	kubelet.sourcesReady = config.NewSourcesReady(func(_ sets.String) bool { return true })
- 	kubelet.masterServiceNamespace = metav1.NamespaceDefault
- 	kubelet.serviceLister = testServiceLister{}
-+	kubelet.serviceHasSynced = func() bool { return true }
- 	kubelet.nodeLister = testNodeLister{
- 		nodes: []*v1.Node{
- 			{
 -- 
 2.33.1
 
